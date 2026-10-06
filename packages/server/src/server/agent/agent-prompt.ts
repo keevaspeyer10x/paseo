@@ -38,6 +38,25 @@ export interface StartAgentRunOptions {
 
 export type PromptDispatchDisposition = "out_of_band" | "steered" | "turn_started";
 
+export type AgentPromptDispatchRefusalReason =
+  | "steering_unavailable"
+  | "permission_paused"
+  | "archived"
+  | "closed"
+  | "start_unavailable";
+
+/** An explicit non-replacing dispatch refusal; callers can inspect its target and reason. */
+export class AgentPromptDispatchError extends Error {
+  constructor(
+    public readonly agentId: string,
+    public readonly reason: AgentPromptDispatchRefusalReason,
+    message: string,
+  ) {
+    super(message);
+    this.name = "AgentPromptDispatchError";
+  }
+}
+
 function isNonReplacingSteer(options: StartAgentRunOptions | undefined): boolean {
   return options?.activeTurnBehavior === "steer" && options.replaceRunning === false;
 }
@@ -65,7 +84,11 @@ async function steerOrReplaceActiveRun(
       clearPendingPermissions: false,
     });
     if (result.status === "unavailable") {
-      throw new Error("Steering is unavailable; the active turn was not replaced");
+      throw new AgentPromptDispatchError(
+        agentId,
+        "steering_unavailable",
+        "Steering is unavailable; the active turn was not replaced",
+      );
     }
     return { disposition: "steered" };
   }
@@ -116,10 +139,18 @@ export async function startAgentRun(
   const snapshot = agentManager.getAgent(agentId);
   if (isNonReplacingSteer(options)) {
     if (snapshot?.lifecycle === "closed") {
-      throw new Error("Closed agents cannot receive a non-replacing steer");
+      throw new AgentPromptDispatchError(
+        agentId,
+        "closed",
+        "Closed agents cannot receive a non-replacing steer",
+      );
     }
     if (snapshot && snapshot.pendingPermissions.size > 0) {
-      throw new Error("Agent is paused for permission; the page was not delivered");
+      throw new AgentPromptDispatchError(
+        agentId,
+        "permission_paused",
+        "Agent is paused for permission; the page was not delivered",
+      );
     }
   }
   logger.trace(
@@ -177,6 +208,18 @@ async function startAgentRunInner(
     },
     "agent.session.start_stream.iterator_returned",
   );
+  if (isNonReplacingSteer(options)) {
+    // The native iterator's first event is the accepted-start boundary. Await it
+    // before acknowledging; a stale or failed idle start must reject this call.
+    const started = await iterator.next();
+    if (started.done || started.value.type !== "turn_started") {
+      throw new AgentPromptDispatchError(
+        agentId,
+        "start_unavailable",
+        "Agent run did not reach an accepted turn start",
+      );
+    }
+  }
   void (async () => {
     try {
       try {
@@ -340,7 +383,11 @@ export async function sendPromptToAgent(
   const record = await params.agentStorage.get(params.agentId);
   if (record?.archivedAt) {
     if (isNonReplacingSteer(params)) {
-      throw new Error("Archived agents cannot receive a non-replacing steer");
+      throw new AgentPromptDispatchError(
+        params.agentId,
+        "archived",
+        "Archived agents cannot receive a non-replacing steer",
+      );
     }
     if (!unarchive) {
       return { disposition: "turn_started" };
@@ -349,7 +396,11 @@ export async function sendPromptToAgent(
   }
 
   if (isNonReplacingSteer(params) && record?.lastStatus === "closed") {
-    throw new Error("Closed agents cannot receive a non-replacing steer");
+    throw new AgentPromptDispatchError(
+      params.agentId,
+      "closed",
+      "Closed agents cannot receive a non-replacing steer",
+    );
   }
 
   await ensureAgentLoaded(params.agentId, {

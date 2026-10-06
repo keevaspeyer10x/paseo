@@ -689,7 +689,12 @@ test("non-replacing steer refuses an unavailable provider without interrupting i
         activeTurnBehavior: "steer",
         runOptions: { clientMessageId: "page-client" },
       }),
-    ).rejects.toThrow("Steering is unavailable; the active turn was not replaced");
+    ).rejects.toMatchObject({
+      name: "AgentPromptDispatchError",
+      agentId: agent.id,
+      reason: "steering_unavailable",
+      message: "Steering is unavailable; the active turn was not replaced",
+    });
     expect(session.startPrompts).toEqual(["initial"]);
     expect(session.startCount).toBe(1);
     expect(session.steerCount).toBe(1);
@@ -785,6 +790,35 @@ test("non-replacing steer starts an idle agent through the guarded native run pa
   }
 });
 
+test("non-replacing steer reports an idle provider start failure without reopening", async () => {
+  const failure = new StaleProviderSessionError("idle-stale-session");
+  const session = new (class extends SteeringTestSession {
+    override async startTurn(prompt: AgentPromptInput): Promise<{ turnId: string }> {
+      this.startPrompts.push(prompt);
+      this.startCount += 1;
+      throw failure;
+    }
+  })({ provider: "codex", cwd: process.cwd() });
+  const scenario = await createNonReplacingSteerScenario(session);
+  const reload = vi.spyOn(scenario.manager, "reloadAgentSession");
+  try {
+    await expect(scenario.page()).rejects.toBe(failure);
+    expect(session.startPrompts).toEqual(["page"]);
+    expect(session.startCount).toBe(1);
+    expect(session.interruptCount).toBe(0);
+    expect(reload).not.toHaveBeenCalled();
+    expect(scenario.manager.getAgent(scenario.agentId)?.activeForegroundTurnId).toBeNull();
+    expect(scenario.manager.fetchTimeline(scenario.agentId, { limit: 0 }).rows).not.toContainEqual(
+      expect.objectContaining({
+        item: expect.objectContaining({ clientMessageId: "page-client" }),
+      }),
+    );
+  } finally {
+    reload.mockRestore();
+    await scenario.close();
+  }
+});
+
 test("non-replacing steer refuses a permission pause without resolving or replacing it", async () => {
   const session = new SteeringTestSession({ provider: "codex", cwd: process.cwd() });
   const scenario = await createNonReplacingSteerScenario(session);
@@ -803,7 +837,11 @@ test("non-replacing steer refuses a permission pause without resolving or replac
         scenario.manager.getAgent(scenario.agentId)?.pendingPermissions.get(request.id),
       ).toEqual(request),
     );
-    await expect(scenario.page()).rejects.toThrow("Agent is paused for permission");
+    await expect(scenario.page()).rejects.toMatchObject({
+      name: "AgentPromptDispatchError",
+      agentId: scenario.agentId,
+      reason: "permission_paused",
+    });
     expect(session.startPrompts).toEqual(["initial"]);
     expect(session.steerCount).toBe(0);
     expect(session.interruptCount).toBe(0);
@@ -861,7 +899,11 @@ test("non-replacing steer refuses an archived target explicitly instead of claim
   const scenario = await createNonReplacingSteerScenario(session);
   try {
     const archived = await scenario.manager.archiveAgent(scenario.agentId);
-    await expect(scenario.page()).rejects.toThrow("Archived agents cannot receive");
+    await expect(scenario.page()).rejects.toMatchObject({
+      name: "AgentPromptDispatchError",
+      agentId: scenario.agentId,
+      reason: "archived",
+    });
     expect((await scenario.storage.get(scenario.agentId))?.archivedAt).toBe(archived.archivedAt);
     expect(session.startCount).toBe(0);
     expect(session.steerCount).toBe(0);
@@ -876,7 +918,11 @@ test("non-replacing steer refuses a closed target without reopening its session"
   const scenario = await createNonReplacingSteerScenario(session);
   try {
     await scenario.manager.closeAgent(scenario.agentId);
-    await expect(scenario.page()).rejects.toThrow("Closed agents cannot receive");
+    await expect(scenario.page()).rejects.toMatchObject({
+      name: "AgentPromptDispatchError",
+      agentId: scenario.agentId,
+      reason: "closed",
+    });
     expect(session.startCount).toBe(0);
     expect(session.steerCount).toBe(0);
     expect(session.interruptCount).toBe(0);
