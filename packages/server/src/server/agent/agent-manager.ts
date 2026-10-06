@@ -2700,6 +2700,11 @@ export class AgentManager {
       return { status: "unavailable" };
     }
     const result = await this.runSteerAdmission(agent, expectedTurnId, async () => {
+      // An explicit preserve-permissions request must stay refused if a permission
+      // pause arrived while the steer waited for foreground admission.
+      if (options?.clearPendingPermissions === false && agent.pendingPermissions.size > 0) {
+        return { status: "unavailable" as const };
+      }
       const admission = await agent.session.steerActiveTurn!(prompt, {
         ...options,
         expectedTurnId,
