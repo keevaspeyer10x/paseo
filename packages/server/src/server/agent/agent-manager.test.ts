@@ -18,7 +18,11 @@ import { InMemoryAgentTimelineStore } from "./agent-timeline-store.js";
 import { toAgentPayload } from "./agent-projections.js";
 import { projectTimelineRows } from "./timeline-projection.js";
 import { getOpenAgentTabLabel, PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
-import { formatSystemNotificationPrompt, startAgentRun } from "./agent-prompt.js";
+import {
+  formatSystemNotificationPrompt,
+  startAgentRun,
+  sendPromptToAgent,
+} from "./agent-prompt.js";
 import { StaleProviderSessionError } from "./stale-provider-session-error.js";
 import { ensureAgentLoaded, ensureUnarchivedAgentLoaded } from "./agent-loading.js";
 import type { StoredAgentRecord } from "./agent-storage.js";
@@ -662,6 +666,323 @@ async function startAndSteerThroughManager(
   });
   return { manager, agentId: agent.id, workdir };
 }
+
+test("non-replacing steer refuses an unavailable provider without interrupting its turn", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-strict-page-"));
+  const session = new SteeringTestSession({ provider: "codex", cwd: workdir });
+  session.steerResult = "unavailable";
+  const client = new (class extends TestAgentClient {
+    override async createSession(): Promise<AgentSession> {
+      return session;
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, logger });
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+  try {
+    void drainAsyncGenerator(manager.streamAgent(agent.id, "initial"));
+    await manager.waitForAgentRunStart(agent.id);
+    await expect(
+      startAgentRun(manager, agent.id, "page", logger, {
+        replaceRunning: false,
+        activeTurnBehavior: "steer",
+        runOptions: { clientMessageId: "page-client" },
+      }),
+    ).rejects.toMatchObject({
+      name: "AgentPromptDispatchError",
+      agentId: agent.id,
+      reason: "steering_unavailable",
+      message: "Steering is unavailable; the active turn was not replaced",
+    });
+    expect(session.startPrompts).toEqual(["initial"]);
+    expect(session.startCount).toBe(1);
+    expect(session.steerCount).toBe(1);
+    expect(session.interruptCount).toBe(0);
+    expect(manager.getAgent(agent.id)?.activeForegroundTurnId).toBe("active-turn-1");
+  } finally {
+    await manager.closeAgent(agent.id);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+async function createNonReplacingSteerScenario(session: SteeringTestSession) {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-page-scenario-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const client = new (class extends TestAgentClient {
+    override async createSession(): Promise<AgentSession> {
+      return session;
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+  return {
+    manager,
+    storage,
+    agentId: agent.id,
+    async start() {
+      void drainAsyncGenerator(manager.streamAgent(agent.id, "initial"));
+      await manager.waitForAgentRunStart(agent.id);
+    },
+    async page() {
+      return sendPromptToAgent({
+        agentManager: manager,
+        agentStorage: storage,
+        agentId: agent.id,
+        prompt: "page",
+        messageId: "page-client",
+        activeTurnBehavior: "steer",
+        replaceRunning: false,
+        unarchive: false,
+        logger,
+      });
+    },
+    async close() {
+      await manager.closeAgent(agent.id);
+      await manager.flush();
+      rmSync(workdir, { recursive: true, force: true });
+    },
+  };
+}
+
+test("non-replacing steer reaches the existing busy turn and records its exact message identity", async () => {
+  const session = new SteeringTestSession({ provider: "codex", cwd: process.cwd() });
+  const scenario = await createNonReplacingSteerScenario(session);
+  try {
+    await scenario.start();
+    await expect(scenario.page()).resolves.toEqual({ disposition: "steered" });
+    expect(session.startPrompts).toEqual(["initial"]);
+    expect(session.interruptCount).toBe(0);
+    expect(session.steerCount).toBe(1);
+    expect(scenario.manager.getAgent(scenario.agentId)?.activeForegroundTurnId).toBe(
+      "active-turn-1",
+    );
+    expect(scenario.manager.fetchTimeline(scenario.agentId, { limit: 0 }).rows).toContainEqual(
+      expect.objectContaining({
+        turnId: "active-turn-1",
+        item: expect.objectContaining({ text: "page", clientMessageId: "page-client" }),
+      }),
+    );
+  } finally {
+    await scenario.close();
+  }
+});
+
+test("non-replacing steer starts an idle agent through the guarded native run path", async () => {
+  const session = new SteeringTestSession({ provider: "codex", cwd: process.cwd() });
+  const scenario = await createNonReplacingSteerScenario(session);
+  try {
+    await expect(scenario.page()).resolves.toEqual({ disposition: "turn_started" });
+    await scenario.manager.waitForAgentRunStart(scenario.agentId);
+    expect(session.startPrompts).toEqual(["page"]);
+    expect(session.interruptCount).toBe(0);
+    expect(session.steerCount).toBe(0);
+    expect(scenario.manager.fetchTimeline(scenario.agentId, { limit: 0 }).rows).toContainEqual(
+      expect.objectContaining({
+        turnId: "active-turn-1",
+        item: expect.objectContaining({ text: "page", clientMessageId: "page-client" }),
+      }),
+    );
+  } finally {
+    await scenario.close();
+  }
+});
+
+test("non-replacing steer reports an idle provider start failure without reopening", async () => {
+  const failure = new StaleProviderSessionError("idle-stale-session");
+  const session = new (class extends SteeringTestSession {
+    override async startTurn(prompt: AgentPromptInput): Promise<{ turnId: string }> {
+      this.startPrompts.push(prompt);
+      this.startCount += 1;
+      throw failure;
+    }
+  })({ provider: "codex", cwd: process.cwd() });
+  const scenario = await createNonReplacingSteerScenario(session);
+  const reload = vi.spyOn(scenario.manager, "reloadAgentSession");
+  try {
+    await expect(scenario.page()).rejects.toBe(failure);
+    expect(session.startPrompts).toEqual(["page"]);
+    expect(session.startCount).toBe(1);
+    expect(session.interruptCount).toBe(0);
+    expect(reload).not.toHaveBeenCalled();
+    expect(scenario.manager.getAgent(scenario.agentId)?.activeForegroundTurnId).toBeNull();
+    expect(scenario.manager.fetchTimeline(scenario.agentId, { limit: 0 }).rows).not.toContainEqual(
+      expect.objectContaining({
+        item: expect.objectContaining({ clientMessageId: "page-client" }),
+      }),
+    );
+  } finally {
+    reload.mockRestore();
+    await scenario.close();
+  }
+});
+
+test("non-replacing steer refuses a permission pause without resolving or replacing it", async () => {
+  const session = new SteeringTestSession({ provider: "codex", cwd: process.cwd() });
+  const scenario = await createNonReplacingSteerScenario(session);
+  try {
+    await scenario.start();
+    const request = {
+      id: "permission-page",
+      provider: "codex" as const,
+      kind: "tool" as const,
+      name: "Synthetic permission",
+      input: {},
+    };
+    session.pushEvent({ type: "permission_requested", provider: "codex", request });
+    await vi.waitFor(() =>
+      expect(
+        scenario.manager.getAgent(scenario.agentId)?.pendingPermissions.get(request.id),
+      ).toEqual(request),
+    );
+    await expect(scenario.page()).rejects.toMatchObject({
+      name: "AgentPromptDispatchError",
+      agentId: scenario.agentId,
+      reason: "permission_paused",
+    });
+    expect(session.startPrompts).toEqual(["initial"]);
+    expect(session.steerCount).toBe(0);
+    expect(session.interruptCount).toBe(0);
+    expect(scenario.manager.getAgent(scenario.agentId)?.pendingPermissions.get(request.id)).toEqual(
+      request,
+    );
+  } finally {
+    await scenario.close();
+  }
+});
+
+test("non-replacing steer rechecks a permission pause queued before foreground admission", async () => {
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  class HeldAcceptedSession extends SteeringTestSession {
+    override async steerActiveTurn(): Promise<import("./agent-sdk-types.js").SteerResult> {
+      this.steerCount += 1;
+      entered.resolve();
+      await release.promise;
+      return { status: "accepted" };
+    }
+  }
+  const session = new HeldAcceptedSession({ provider: "codex", cwd: process.cwd() });
+  const scenario = await createNonReplacingSteerScenario(session);
+  try {
+    await scenario.start();
+    const first = scenario.manager.steerAgentRun(scenario.agentId, "held steer");
+    await entered.promise;
+    const page = scenario.page();
+    const request = {
+      id: "queued-permission",
+      provider: "codex" as const,
+      kind: "tool" as const,
+      name: "Synthetic permission",
+      input: {},
+    };
+    session.pushEvent({ type: "permission_requested", provider: "codex", request });
+    release.resolve();
+    await expect(first).resolves.toEqual({ status: "accepted" });
+    await expect(page).rejects.toThrow("Steering is unavailable; the active turn was not replaced");
+    expect(session.steerCount).toBe(1);
+    expect(session.startPrompts).toEqual(["initial"]);
+    expect(session.interruptCount).toBe(0);
+    expect(scenario.manager.getAgent(scenario.agentId)?.pendingPermissions.get(request.id)).toEqual(
+      request,
+    );
+  } finally {
+    release.resolve();
+    await scenario.close();
+  }
+});
+
+test("non-replacing steer refuses an archived target explicitly instead of claiming a turn started", async () => {
+  const session = new SteeringTestSession({ provider: "codex", cwd: process.cwd() });
+  const scenario = await createNonReplacingSteerScenario(session);
+  try {
+    const archived = await scenario.manager.archiveAgent(scenario.agentId);
+    await expect(scenario.page()).rejects.toMatchObject({
+      name: "AgentPromptDispatchError",
+      agentId: scenario.agentId,
+      reason: "archived",
+    });
+    expect((await scenario.storage.get(scenario.agentId))?.archivedAt).toBe(archived.archivedAt);
+    expect(session.startCount).toBe(0);
+    expect(session.steerCount).toBe(0);
+    expect(session.interruptCount).toBe(0);
+  } finally {
+    await scenario.close();
+  }
+});
+
+test("non-replacing steer refuses a closed target without reopening its session", async () => {
+  const session = new SteeringTestSession({ provider: "codex", cwd: process.cwd() });
+  const scenario = await createNonReplacingSteerScenario(session);
+  try {
+    await scenario.manager.closeAgent(scenario.agentId);
+    await expect(scenario.page()).rejects.toMatchObject({
+      name: "AgentPromptDispatchError",
+      agentId: scenario.agentId,
+      reason: "closed",
+    });
+    expect(session.startCount).toBe(0);
+    expect(session.steerCount).toBe(0);
+    expect(session.interruptCount).toBe(0);
+  } finally {
+    await scenario.close();
+  }
+});
+
+test("non-replacing steer cannot interrupt a run admitted after its idle observation", async () => {
+  const session = new SteeringTestSession({ provider: "codex", cwd: process.cwd() });
+  const scenario = await createNonReplacingSteerScenario(session);
+  try {
+    vi.spyOn(scenario.manager, "hasInFlightRun").mockImplementationOnce(() => {
+      void drainAsyncGenerator(scenario.manager.streamAgent(scenario.agentId, "concurrent"));
+      return false;
+    });
+    await expect(scenario.page()).rejects.toThrow("already has an active run");
+    await scenario.manager.waitForAgentRunStart(scenario.agentId);
+    expect(session.startPrompts).toEqual(["concurrent"]);
+    expect(session.interruptCount).toBe(0);
+    expect(session.steerCount).toBe(0);
+  } finally {
+    vi.restoreAllMocks();
+    await scenario.close();
+  }
+});
+
+test("non-replacing steer refuses a turn that ends while provider admission is pending", async () => {
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  class HeldUnavailableSession extends SteeringTestSession {
+    override async steerActiveTurn(): Promise<import("./agent-sdk-types.js").SteerResult> {
+      this.steerCount += 1;
+      entered.resolve();
+      await release.promise;
+      return { status: "unavailable" };
+    }
+  }
+  const session = new HeldUnavailableSession({ provider: "codex", cwd: process.cwd() });
+  const scenario = await createNonReplacingSteerScenario(session);
+  try {
+    await scenario.start();
+    const page = scenario.page();
+    await entered.promise;
+    session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-1" });
+    release.resolve();
+    await expect(page).rejects.toThrow("Active turn changed before steering could be delivered");
+    expect(session.startPrompts).toEqual(["initial"]);
+    expect(session.interruptCount).toBe(0);
+    void drainAsyncGenerator(scenario.manager.streamAgent(scenario.agentId, "subsequent"));
+    await scenario.manager.waitForAgentRunStart(scenario.agentId);
+    expect(session.startPrompts).toEqual(["initial", "subsequent"]);
+    expect(scenario.manager.getAgent(scenario.agentId)?.activeForegroundTurnId).toBe(
+      "active-turn-2",
+    );
+  } finally {
+    release.resolve();
+    await scenario.close();
+  }
+});
 
 test("uses an injected timeline store without making it a production requirement", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-timeline-store-"));

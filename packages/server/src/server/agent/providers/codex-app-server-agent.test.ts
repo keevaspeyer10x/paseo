@@ -223,6 +223,54 @@ function deferred<T>() {
 }
 
 describe("Codex active-turn steering admission", () => {
+  test("a non-clearing steer refuses a permission arriving during preparation", async () => {
+    const commandResolution = deferred<{ commandName: string } | null>();
+    const resolverEntered = deferred<void>();
+    const appServer = createFakeCodexAppServer({
+      "turn/steer": () => ({ turn: { id: "native-A" } }),
+    });
+    const { session, paseoTurnId } = await startPublicSteeringSession(appServer, async (prompt) => {
+      if (prompt !== "held notification") return null;
+      resolverEntered.resolve();
+      return commandResolution.promise;
+    });
+
+    try {
+      const steer = session.steerActiveTurn!("held notification", {
+        expectedTurnId: paseoTurnId,
+        clearPendingPermissions: false,
+      });
+      await resolverEntered.promise;
+      const permissionRequested = waitForNextPermission(session);
+      appServer.requestCommandApproval({
+        itemId: "held-command",
+        threadId: "thread-1",
+        turnId: "native-A",
+        command: "git status",
+        cwd: "/workspace/project",
+        reason: "Needs approval",
+      });
+      await permissionRequested;
+      const pendingPermissions = session.getPendingPermissions();
+      expect(pendingPermissions).toHaveLength(1);
+      commandResolution.resolve(null);
+
+      await expect(steer).resolves.toEqual({ status: "unavailable" });
+      expect(session.getPendingPermissions()).toEqual(pendingPermissions);
+      expect(appServer.requests().filter((request) => request.method === "turn/steer")).toEqual([]);
+      expect(appServer.requests().filter((request) => request.method === "turn/interrupt")).toEqual(
+        [],
+      );
+      expect(
+        appServer.requests().filter((request) => request.method === "turn/start"),
+      ).toHaveLength(1);
+    } finally {
+      commandResolution.resolve(null);
+      await session.close();
+      appServer.assertNoErrors();
+    }
+  });
+
   test("a steer without the clearing contract leaves permissions open", async () => {
     const appServer = createFakeCodexAppServer({
       "turn/steer": () => ({ turn: { id: "native-A" } }),
@@ -241,6 +289,44 @@ describe("Codex active-turn steering admission", () => {
     await session.respondToPermission(requestId, { behavior: "deny", message: "test cleanup" });
     await session.close();
     appServer.assertNoErrors();
+  });
+
+  test("a non-clearing steer refuses an unanswered user question", async () => {
+    const appServer = createFakeCodexAppServer({
+      "turn/steer": () => ({ turn: { id: "native-A" } }),
+    });
+    const { session, paseoTurnId } = await startPublicSteeringSession(appServer);
+    try {
+      const permissionRequested = waitForNextPermission(session);
+      appServer.requestUserInput({
+        itemId: "pending-question",
+        threadId: "thread-1",
+        turnId: "native-A",
+        questions: [
+          {
+            id: "choice",
+            header: "Choice",
+            question: "Which option?",
+            options: [{ label: "One" }, { label: "Two" }],
+          },
+        ],
+      });
+      await permissionRequested;
+      const pendingPermissions = session.getPendingPermissions();
+      expect(pendingPermissions).toHaveLength(1);
+
+      await expect(
+        session.steerActiveTurn!("notification", {
+          expectedTurnId: paseoTurnId,
+          clearPendingPermissions: false,
+        }),
+      ).resolves.toEqual({ status: "unavailable" });
+      expect(session.getPendingPermissions()).toEqual(pendingPermissions);
+      expect(appServer.requests().filter((request) => request.method === "turn/steer")).toEqual([]);
+    } finally {
+      await session.close();
+      appServer.assertNoErrors();
+    }
   });
 
   test("a clearing steer denies every pending permission through its provider handler", async () => {

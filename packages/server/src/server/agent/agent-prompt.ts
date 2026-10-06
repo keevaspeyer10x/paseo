@@ -20,6 +20,7 @@ export type AgentRunController = Pick<
   | "tryRunOutOfBand"
   | "hasInFlightRun"
   | "replaceAgentRun"
+  | "steerAgentRun"
   | "steerOrReplaceActiveTurn"
   | "streamAgent"
 > & {
@@ -27,6 +28,7 @@ export type AgentRunController = Pick<
 };
 
 export interface StartAgentRunOptions {
+  /** False with `steer` refuses replacement, permission clearing and session reopening. */
   replaceRunning?: boolean;
   activeTurnBehavior?: ActiveTurnBehavior;
   runOptions?: AgentRunOptions;
@@ -35,6 +37,29 @@ export interface StartAgentRunOptions {
 }
 
 export type PromptDispatchDisposition = "out_of_band" | "steered" | "turn_started";
+
+export type AgentPromptDispatchRefusalReason =
+  | "steering_unavailable"
+  | "permission_paused"
+  | "archived"
+  | "closed"
+  | "start_unavailable";
+
+/** An explicit non-replacing dispatch refusal; callers can inspect its target and reason. */
+export class AgentPromptDispatchError extends Error {
+  constructor(
+    public readonly agentId: string,
+    public readonly reason: AgentPromptDispatchRefusalReason,
+    message: string,
+  ) {
+    super(message);
+    this.name = "AgentPromptDispatchError";
+  }
+}
+
+function isNonReplacingSteer(options: StartAgentRunOptions | undefined): boolean {
+  return options?.activeTurnBehavior === "steer" && options.replaceRunning === false;
+}
 
 async function steerOrReplaceActiveRun(
   agentManager: AgentRunController,
@@ -51,6 +76,21 @@ async function steerOrReplaceActiveRun(
 > {
   if (options?.activeTurnBehavior !== "steer") {
     return null;
+  }
+  if (isNonReplacingSteer(options)) {
+    if (!agentManager.hasInFlightRun(agentId)) return null;
+    const result = await agentManager.steerAgentRun(agentId, prompt, {
+      ...options.runOptions,
+      clearPendingPermissions: false,
+    });
+    if (result.status === "unavailable") {
+      throw new AgentPromptDispatchError(
+        agentId,
+        "steering_unavailable",
+        "Steering is unavailable; the active turn was not replaced",
+      );
+    }
+    return { disposition: "steered" };
   }
   const steerOptions = options.clearPendingPermissions
     ? { ...options.runOptions, clearPendingPermissions: true }
@@ -97,6 +137,22 @@ export async function startAgentRun(
   options?: StartAgentRunOptions,
 ): Promise<{ disposition: PromptDispatchDisposition }> {
   const snapshot = agentManager.getAgent(agentId);
+  if (isNonReplacingSteer(options)) {
+    if (snapshot?.lifecycle === "closed") {
+      throw new AgentPromptDispatchError(
+        agentId,
+        "closed",
+        "Closed agents cannot receive a non-replacing steer",
+      );
+    }
+    if (snapshot && snapshot.pendingPermissions.size > 0) {
+      throw new AgentPromptDispatchError(
+        agentId,
+        "permission_paused",
+        "Agent is paused for permission; the page was not delivered",
+      );
+    }
+  }
   logger.trace(
     {
       agentId,
@@ -118,6 +174,7 @@ export async function startAgentRun(
   try {
     return await startAgentRunInner(agentManager, agentId, prompt, logger, options);
   } catch (error) {
+    if (isNonReplacingSteer(options)) throw error;
     if (!isStaleProviderSessionError(error)) throw error;
     logger.info({ agentId, err: error }, "Provider session went stale; reopening from persistence");
     // The live session belongs to a retired plugin runtime. Reload swaps in a
@@ -151,11 +208,24 @@ async function startAgentRunInner(
     },
     "agent.session.start_stream.iterator_returned",
   );
+  if (isNonReplacingSteer(options)) {
+    // The native iterator's first event is the accepted-start boundary. Await it
+    // before acknowledging; a stale or failed idle start must reject this call.
+    const started = await iterator.next();
+    if (started.done || started.value.type !== "turn_started") {
+      throw new AgentPromptDispatchError(
+        agentId,
+        "start_unavailable",
+        "Agent run did not reach an accepted turn start",
+      );
+    }
+  }
   void (async () => {
     try {
       try {
         await drainAgentRunIterator(iterator);
       } catch (error) {
+        if (isNonReplacingSteer(options)) throw error;
         if (!isStaleProviderSessionError(error)) throw error;
         logger.info(
           { agentId, err: error },
@@ -229,6 +299,8 @@ export interface SendPromptToAgentParams {
   prompt: AgentPromptInput;
   messageId?: string;
   activeTurnBehavior?: ActiveTurnBehavior;
+  /** Default true. See {@link StartAgentRunOptions.replaceRunning}. */
+  replaceRunning?: boolean;
   runOptions?: AgentRunOptions;
   /** Optional mode to set on the agent before the run starts. */
   sessionMode?: string;
@@ -310,10 +382,25 @@ export async function sendPromptToAgent(
 
   const record = await params.agentStorage.get(params.agentId);
   if (record?.archivedAt) {
+    if (isNonReplacingSteer(params)) {
+      throw new AgentPromptDispatchError(
+        params.agentId,
+        "archived",
+        "Archived agents cannot receive a non-replacing steer",
+      );
+    }
     if (!unarchive) {
       return { disposition: "turn_started" };
     }
     await unarchiveAgentState(params.agentStorage, params.agentManager, params.agentId);
+  }
+
+  if (isNonReplacingSteer(params) && record?.lastStatus === "closed") {
+    throw new AgentPromptDispatchError(
+      params.agentId,
+      "closed",
+      "Closed agents cannot receive a non-replacing steer",
+    );
   }
 
   await ensureAgentLoaded(params.agentId, {
@@ -331,7 +418,7 @@ export async function sendPromptToAgent(
     : params.runOptions;
 
   return await startAgentRun(params.agentManager, params.agentId, params.prompt, params.logger, {
-    replaceRunning: true,
+    replaceRunning: params.replaceRunning ?? true,
     activeTurnBehavior: params.activeTurnBehavior,
     clearPendingPermissions: params.clearPendingPermissions,
     runOptions,

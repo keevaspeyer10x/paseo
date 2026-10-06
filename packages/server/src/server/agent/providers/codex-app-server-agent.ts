@@ -4432,6 +4432,9 @@ export class CodexAppServerAgentSession implements AgentSession {
     if (!this.matchesSteerAdmission({ client, threadId, nativeTurnId, foregroundTurnId })) {
       return { status: "unavailable" };
     }
+    if (options.clearPendingPermissions === false && this.getPendingPermissions().length > 0) {
+      return { status: "unavailable" };
+    }
     try {
       const response = await client.request(
         "turn/steer",
