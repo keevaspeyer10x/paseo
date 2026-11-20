@@ -42,6 +42,8 @@ contextBridge.exposeInMainWorld("paseoDesktop", {
         serverId: string;
         agentId: string;
       } | null>,
+    ack: (target: { serverId: string; agentId: string }) =>
+      ipcRenderer.invoke("paseo:agent-navigation:ack", target) as Promise<void>,
   },
   events: {
     on: (event: string, handler: EventHandler): Promise<() => void> => {

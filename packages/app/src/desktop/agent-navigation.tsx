@@ -17,6 +17,7 @@ export function AgentNavigationListener() {
       return;
     }
     navigateToAgent({ serverId, agentId });
+    void getDesktopHost()?.agentNavigation?.ack?.({ serverId, agentId });
   });
 
   useEffect(() => {
