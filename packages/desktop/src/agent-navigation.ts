@@ -33,6 +33,16 @@ export class AgentNavigationInbox {
     return null;
   }
 
+  /**
+   * Discard a queued target for a window, e.g. after a delivery watchdog falls
+   * back to opening a dedicated window. Readiness is preserved — a live
+   * listener only calls ready() once per mount, and a stale-ready window is
+   * still covered by the watchdog on the next delivery.
+   */
+  discardPending(webContentsId: number): void {
+    this.pendingByWindow.delete(webContentsId);
+  }
+
   removeWindow(webContentsId: number): void {
     this.readyWindows.delete(webContentsId);
     this.pendingByWindow.delete(webContentsId);

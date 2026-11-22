@@ -127,6 +127,7 @@ export interface DesktopEventsBridge {
 
 export interface DesktopAgentNavigationBridge {
   ready?: () => Promise<{ serverId: string; agentId: string } | null>;
+  ack?: (target: { serverId: string; agentId: string }) => Promise<void>;
 }
 
 export type DesktopBrowserShortcutEvent =

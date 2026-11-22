@@ -30,4 +30,18 @@ describe("desktop agent navigation", () => {
     expect(inbox.windowReady(7)).toEqual({ serverId: "server-1", agentId: "agent-2" });
     expect(inbox.windowReady(7)).toBeNull();
   });
+
+  it("discards a queued target but keeps the window's readiness", () => {
+    const inbox = new AgentNavigationInbox();
+    inbox.deliverOrQueue(7, { serverId: "server-1", agentId: "agent-1" });
+    inbox.windowReady(7);
+    inbox.deliverOrQueue(8, { serverId: "server-1", agentId: "agent-2" });
+
+    inbox.discardPending(8);
+
+    expect(inbox.windowReady(8)).toBeNull();
+    const target = { serverId: "server-1", agentId: "agent-3" };
+    expect(inbox.deliverOrQueue(7, target)).toEqual(target);
+    expect(inbox.deliverOrQueue(8, target)).toEqual(target);
+  });
 });

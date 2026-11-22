@@ -386,6 +386,20 @@ ipcMain.handle("paseo:agent-navigation:ready", (event) => {
   return agentNavigationInbox.windowReady(event.sender.id);
 });
 
+ipcMain.handle("paseo:agent-navigation:ack", (event, rawTarget: unknown) => {
+  const target =
+    rawTarget && typeof rawTarget === "object"
+      ? (rawTarget as { serverId?: unknown; agentId?: unknown })
+      : null;
+  if (typeof target?.serverId !== "string" || typeof target?.agentId !== "string") {
+    return;
+  }
+  desktopWindowOwner.acknowledgeAgentDelivery(event.sender.id, {
+    serverId: target.serverId,
+    agentId: target.agentId,
+  });
+});
+
 ipcMain.handle("paseo:browser:register-attached", (event, rawInput: unknown) => {
   const input = readAttachedBrowserInput(rawInput);
   if (!input) {
@@ -823,6 +837,10 @@ desktopWindowOwner = createDesktopWindowOwner<AgentDeepLinkTarget>({
   agentRoute: buildAgentDeepLinkRoute,
   deliverAgent: (webContentsId, target) =>
     agentNavigationInbox.deliverOrQueue(webContentsId, target),
+  sameAgentTarget: (a, b) => a.serverId === b.serverId && a.agentId === b.agentId,
+  expireAgentDelivery: (webContentsId) => agentNavigationInbox.discardPending(webContentsId),
+  reportAgentDeliveryError: (error, target) =>
+    log.error("[agent-navigation] fallback window failed to open", { target, error }),
 });
 
 // ---------------------------------------------------------------------------
